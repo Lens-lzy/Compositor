@@ -53,6 +53,7 @@ nonisolated final class CMYKConversion {
     let space: CGColorSpace
     private let forward: ColorSyncTransform
     private let gamut: ColorSyncTransform?
+    private let gamutInput: ColorSyncTransform?
 
     init(profile: CMYKProfile, intent: CMYKIntent) throws {
         guard let space = CGColorSpace(iccData: profile.data as CFData),
@@ -70,10 +71,24 @@ nonisolated final class CMYKConversion {
             stage(cmyk, kColorSyncTransformPCSToDevice, intent.value)
         ] as CFArray, nil)?.takeRetainedValue() else { throw CMYKError.conversion }
         self.forward = forward
-        gamut = profile.supportsGamutWarning ? ColorSyncTransformCreate([
-            stage(rgb, kColorSyncTransformDeviceToPCS, CMYKIntent.relative.value),
-            stage(cmyk, kColorSyncTransformGamutCheck, CMYKIntent.relative.value)
-        ] as CFArray, nil)?.takeRetainedValue() : nil
+        if profile.supportsGamutWarning {
+            // macOS 26 can produce NaN in a combined sRGB TRC/gamut pipeline. Keep the
+            // RGB-to-Lab conversion separate from the profile's gamut-check transform.
+            guard let lab = ColorSyncProfileCreateWithName(kColorSyncGenericLabProfile.takeUnretainedValue())?.takeRetainedValue(),
+                  let input = ColorSyncTransformCreate([
+                    stage(rgb, kColorSyncTransformDeviceToPCS, CMYKIntent.relative.value),
+                    stage(lab, kColorSyncTransformPCSToDevice, CMYKIntent.relative.value)
+                  ] as CFArray, nil)?.takeRetainedValue(),
+                  let check = ColorSyncTransformCreate([
+                    stage(lab, kColorSyncTransformDeviceToPCS, CMYKIntent.relative.value),
+                    stage(cmyk, kColorSyncTransformGamutCheck, CMYKIntent.relative.value)
+                  ] as CFArray, nil)?.takeRetainedValue() else { throw CMYKError.conversion }
+            gamutInput = input
+            gamut = check
+        } else {
+            gamutInput = nil
+            gamut = nil
+        }
     }
 
     /// Flatten before conversion: CMYK TIFF has four ink channels and no alpha channel.
@@ -141,16 +156,24 @@ nonisolated final class CMYKConversion {
         let data = try inks(input)
         let output = try display(self.image(data, width: image.width, height: image.height))
         if warning {
-            guard let gamut else { throw CMYKError.conversion }
+            guard let gamut, let gamutInput else { throw CMYKError.conversion }
             // A gamut-check transform produces one floating-point component per pixel: 0 inside, 1 outside.
             // Work a row at a time so the warning doesn't allocate another full image.
+            var lab = [Float](repeating: 0, count: image.width * 3)
             var row = [Float](repeating: 0, count: image.width)
             for y in 0..<image.height {
-                let success = row.withUnsafeMutableBytes { bytes in
-                    ColorSyncTransformConvert(gamut, image.width, 1, bytes.baseAddress!, kColorSync32BitFloat,
-                        kColorSyncAlphaNone.rawValue, image.width * 4, input.data!.advanced(by: y * input.bytesPerRow),
+                try Task.checkCancellation()
+                let converted = lab.withUnsafeMutableBytes { bytes in
+                    ColorSyncTransformConvert(gamutInput, image.width, 1, bytes.baseAddress!, kColorSync32BitFloat,
+                        kColorSyncAlphaNone.rawValue, image.width * 12, input.data!.advanced(by: y * input.bytesPerRow),
                         kColorSync8BitInteger, kColorSyncAlphaNoneSkipLast.rawValue, input.bytesPerRow, nil)
                 }
+                guard converted else { throw CMYKError.conversion }
+                let success = row.withUnsafeMutableBytes { bytes in lab.withUnsafeBytes { source in
+                    ColorSyncTransformConvert(gamut, image.width, 1, bytes.baseAddress!, kColorSync32BitFloat,
+                        kColorSyncAlphaNone.rawValue, image.width * 4, source.baseAddress!,
+                        kColorSync32BitFloat, kColorSyncAlphaNone.rawValue, image.width * 12, nil)
+                } }
                 guard success else { throw CMYKError.conversion }
                 let pixels = output.data!.advanced(by: y * output.bytesPerRow).assumingMemoryBound(to: UInt8.self)
                 for x in 0..<image.width where row[x] > 0.5 {
