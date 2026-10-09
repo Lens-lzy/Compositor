@@ -142,12 +142,12 @@ nonisolated final class CMYKConversion {
         let output = try display(self.image(data, width: image.width, height: image.height))
         if warning {
             guard let gamut else { throw CMYKError.conversion }
-            // A gamut-check transform produces one floating-point component per pixel: 0 inside, 1 outside.
+            // Request ColorSync's gamut-check format, which yields scalar flags: 0 inside, 1 outside.
             // Work a row at a time so the warning doesn't allocate another full image.
             var row = [Float](repeating: 0, count: image.width)
             for y in 0..<image.height {
                 let success = row.withUnsafeMutableBytes { bytes in
-                    ColorSyncTransformConvert(gamut, image.width, 1, bytes.baseAddress!, kColorSync32BitFloat,
+                    ColorSyncTransformConvert(gamut, image.width, 1, bytes.baseAddress!, kColorSync1BitGamut,
                         kColorSyncAlphaNone.rawValue, image.width * 4, input.data!.advanced(by: y * input.bytesPerRow),
                         kColorSync8BitInteger, kColorSyncAlphaNoneSkipLast.rawValue, input.bytesPerRow, nil)
                 }
