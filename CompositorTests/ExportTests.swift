@@ -106,6 +106,31 @@ struct ExportTests {
         return PrintSettings(profile: try CMYKProfile(data: data), intent: intent)
     }
 
+    private func gamutSettings() throws -> PrintSettings {
+        let settings = try printSettings()
+        let selected = try #require(settings.profile)
+        // System CMYK profiles need not contain a gamut table. Supply a deterministic
+        // Lab LUT for this test: neutral colors are inside, saturated colors outside.
+        #expect(String(decoding: selected.data[20..<24], as: UTF8.self) == "Lab ")
+        let original = try #require(ColorSyncProfileCreate(selected.data as CFData, nil)?.takeRetainedValue())
+        let mutable = try #require(ColorSyncProfileCreateMutableCopy(original)?.takeRetainedValue())
+        var tag = Data("mft1".utf8)
+        tag.append(contentsOf: [0, 0, 0, 0, 3, 1, 3, 0])
+        for i in 0..<9 {
+            tag.append(contentsOf: i % 4 == 0 ? [0, 1, 0, 0] : [0, 0, 0, 0])
+        }
+        for _ in 0..<3 { tag.append(contentsOf: (0..<256).map { UInt8($0) }) }
+        for _ in 0..<3 { for a in 0..<3 { for b in 0..<3 {
+            tag.append(a == 1 && b == 1 ? 0 : 255)
+        } } }
+        tag.append(contentsOf: (0..<256).map { UInt8($0) })
+        ColorSyncProfileSetTag(mutable, "gamt" as CFString, tag as CFData)
+        let data = ColorSyncProfileCopyData(mutable, nil).takeRetainedValue() as Data
+        let profile = try CMYKProfile(data: data)
+        #expect(profile.supportsGamutWarning)
+        return PrintSettings(profile: profile)
+    }
+
     @Test(arguments: [CMYKIntent.relative, .perceptual])
     func cmykTIFFKeepsProfileResolutionAndInkChannels(intent: CMYKIntent) async throws {
         let raster = try await ImageExporter.shared.render(snapshot())
@@ -142,7 +167,7 @@ struct ExportTests {
 
     @Test func cmykBackgroundAndGamutWarningAreViewOnly() async throws {
         let raster = try await ImageExporter.shared.render(snapshot())
-        var settings = try printSettings()
+        var settings = try gamutSettings()
         settings.background = PaletteColor(red: 0, green: 0, blue: 1)
         let conversion = try CMYKConversion(profile: #require(settings.profile), intent: settings.intent)
         let image = try conversion.image(raster.image, background: settings.background)
@@ -235,7 +260,7 @@ struct ExportTests {
     }
 
     @Test func profileWithoutGamutDataStillExportsAndProofs() async throws {
-        let settings = try printSettings()
+        let settings = try gamutSettings()
         let selected = try #require(settings.profile)
         let original = try #require(ColorSyncProfileCreate(selected.data as CFData, nil)?.takeRetainedValue())
         let mutable = try #require(ColorSyncProfileCreateMutableCopy(original)?.takeRetainedValue())
