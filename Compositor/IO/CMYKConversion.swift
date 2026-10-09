@@ -144,7 +144,9 @@ nonisolated final class CMYKConversion {
             guard let gamut else { throw CMYKError.conversion }
             // Request ColorSync's gamut-check format, which yields scalar flags: 0 inside, 1 outside.
             // Work a row at a time so the warning doesn't allocate another full image.
-            var row = [Float](repeating: 0, count: image.width)
+            // Reserve scalar-float space too: newer ColorSync versions return float flags
+            // even for the gamut format. Untouched NaNs distinguish packed-bit output.
+            var row = [Float](repeating: .nan, count: image.width)
             for y in 0..<image.height {
                 let success = row.withUnsafeMutableBytes { bytes in
                     ColorSyncTransformConvert(gamut, image.width, 1, bytes.baseAddress!, kColorSync1BitGamut,
@@ -153,8 +155,14 @@ nonisolated final class CMYKConversion {
                 }
                 guard success else { throw CMYKError.conversion }
                 let pixels = output.data!.advanced(by: y * output.bytesPerRow).assumingMemoryBound(to: UInt8.self)
-                for x in 0..<image.width where row[x] > 0.5 {
-                    pixels[x * 4] = 128; pixels[x * 4 + 1] = 128; pixels[x * 4 + 2] = 128
+                row.withUnsafeBytes { bytes in
+                    let packed = !row[image.width - 1].isFinite
+                    for x in 0..<image.width {
+                        let outside = packed ? bytes[x / 8] & (0x80 >> (x % 8)) != 0 : row[x] > 0.5
+                        if outside {
+                            pixels[x * 4] = 128; pixels[x * 4 + 1] = 128; pixels[x * 4 + 2] = 128
+                        }
+                    }
                 }
             }
         }
